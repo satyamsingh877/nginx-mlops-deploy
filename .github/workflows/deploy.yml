@@ -25,10 +25,12 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
       
       - name: Validate file structure
         run: |
+          echo "🔍 Validating file structure..."
           required_files=(
             "nginx/Dockerfile"
             "nginx/index.html"
@@ -43,35 +45,204 @@ jobs:
               exit 1
             fi
           done
+          
+          # Check if scripts are executable
+          chmod +x scripts/*.sh
+          echo "✅ Scripts are now executable"
 
   test:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
       
-      - name: Test Docker build
-        run: docker build -t test-nginx ./nginx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
       
-      - name: Test container
+      - name: Build Docker image
         run: |
-          docker run -d --name test-nginx -p 8081:80 test-nginx
-          sleep 5
-          curl -f http://localhost:8082 || exit 1
-          docker stop test-nginx
-          docker rm test-nginx
-
-  deploy:
-    needs: test
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
-    steps:
-      - uses: actions/checkout@v3
+          echo "📦 Building Docker image..."
+          docker build -t test-nginx:latest ./nginx
+          echo "✅ Docker image built successfully"
       
-      - name: Configure SSH
+      - name: Test Docker image
+        run: |
+          echo "🧪 Testing Docker image..."
+          
+          # Run container
+          docker run -d --name test-nginx -p 8082:80 test-nginx:latest
+          
+          # Wait for container to be ready with timeout
+          echo "⏳ Waiting for container to be ready..."
+          timeout=30
+          counter=0
+          while [ $counter -lt $timeout ]; do
+            if docker ps | grep -q test-nginx; then
+              echo "✅ Container is running"
+              break
+            fi
+            sleep 1
+            counter=$((counter + 1))
+          done
+          
+          # Wait for nginx to start inside container
+          echo "⏳ Waiting for nginx to start..."
+          sleep 5
+          
+          # Test container with retries
+          echo "🌐 Testing HTTP connection..."
+          max_retries=10
+          retry_count=0
+          while [ $retry_count -lt $max_retries ]; do
+            if curl -s -f -o /dev/null http://localhost:8082; then
+              echo "✅ Container is serving content"
+              
+              # Get and display the content
+              echo "📄 Page content preview:"
+              curl -s http://localhost:8082 | grep -o "<title>.*</title>" || echo "  (title not found)"
+              
+              break
+            else
+              retry_count=$((retry_count + 1))
+              echo "⏳ Waiting for service... ($retry_count/$max_retries)"
+              sleep 2
+            fi
+          done
+          
+          if [ $retry_count -eq $max_retries ]; then
+            echo "❌ Failed to connect to container"
+            echo "📋 Container logs:"
+            docker logs test-nginx
+            exit 1
+          fi
+          
+          # Test health endpoint
+          echo "🏥 Testing health endpoint..."
+          if curl -s -f http://localhost:8082/health | grep -q "healthy"; then
+            echo "✅ Health endpoint is working"
+          else
+            echo "❌ Health endpoint failed"
+            docker logs test-nginx
+            exit 1
+          fi
+          
+          # Show container stats
+          echo "📊 Container stats:"
+          docker ps --filter "name=test-nginx" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "🧹 Cleaning up..."
+          docker stop test-nginx || true
+          docker rm test-nginx || true
+          echo "✅ Cleanup completed"
+
+  deploy-local:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Install SSH client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client
+      
+      - name: Set up SSH key
         uses: webfactory/ssh-agent@v0.8.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      
+      - name: Add host to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.HOST_IP }} >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+      
+      - name: Test SSH connection
+        run: |
+          echo "🔌 Testing SSH connection..."
+          ssh -o ConnectTimeout=5 ${{ secrets.HOST_USER }}@${{ secrets.HOST_IP }} "echo '✅ SSH connection successful'"
+      
+      - name: Check port availability on remote
+        env:
+          HOST_IP: ${{ secrets.HOST_IP }}
+          HOST_USER: ${{ secrets.HOST_USER }}
+          DEPLOY_PORT: ${{ github.event.inputs.port || '8081' }}
+        run: |
+          echo "🔍 Checking if port $DEPLOY_PORT is available on remote machine..."
+          
+          # Check if port is in use
+          PORT_CHECK=$(ssh $HOST_USER@$HOST_IP "if command -v lsof >/dev/null 2>&1; then
+              if lsof -Pi :$DEPLOY_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+                echo 'inuse'
+              else
+                echo 'free'
+              fi
+            elif command -v netstat >/dev/null 2>&1; then
+              if netstat -tuln | grep -q ':$DEPLOY_PORT '; then
+                echo 'inuse'
+              else
+                echo 'free'
+              fi
+            else
+              echo 'unknown'
+            fi")
+          
+          if [ "$PORT_CHECK" == "inuse" ]; then
+            echo "❌ Port $DEPLOY_PORT is already in use on the remote machine"
+            ssh $HOST_USER@$HOST_IP "sudo lsof -i :$DEPLOY_PORT || sudo netstat -tulpn | grep :$DEPLOY_PORT"
+            exit 1
+          elif [ "$PORT_CHECK" == "free" ]; then
+            echo "✅ Port $DEPLOY_PORT is available"
+          else
+            echo "⚠️ Could not determine port status, continuing anyway..."
+          fi
+      
+      - name: Prepare remote directory
+        env:
+          HOST_IP: ${{ secrets.HOST_IP }}
+          HOST_USER: ${{ secrets.HOST_USER }}
+        run: |
+          echo "📁 Preparing remote directory..."
+          ssh $HOST_USER@$HOST_IP "
+            mkdir -p ~/nginx-mlops-deploy
+            rm -rf ~/nginx-mlops-deploy/* 2>/dev/null || true
+          "
+          echo "✅ Remote directory ready"
+      
+      - name: Copy files to remote
+        env:
+          HOST_IP: ${{ secrets.HOST_IP }}
+          HOST_USER: ${{ secrets.HOST_USER }}
+        run: |
+          echo "📋 Copying files to remote machine..."
+          
+          # Copy nginx configuration
+          scp -r nginx/ $HOST_USER@$HOST_IP:~/nginx-mlops-deploy/
+          
+          # Copy scripts
+          scp -r scripts/ $HOST_USER@$HOST_IP:~/nginx-mlops-deploy/
+          
+          # Copy docker-compose if exists
+          if [ -f docker-compose.yml ]; then
+            scp docker-compose.yml $HOST_USER@$HOST_IP:~/nginx-mlops-deploy/
+          fi
+          
+          echo "✅ Files copied successfully"
+      
+      - name: Make scripts executable on remote
+        env:
+          HOST_IP: ${{ secrets.HOST_IP }}
+          HOST_USER: ${{ secrets.HOST_USER }}
+        run: |
+          ssh $HOST_USER@$HOST_IP "chmod +x ~/nginx-mlops-deploy/scripts/*.sh"
+          echo "✅ Scripts are executable"
       
       - name: Deploy application
         env:
@@ -79,19 +250,114 @@ jobs:
           HOST_USER: ${{ secrets.HOST_USER }}
           DEPLOY_PORT: ${{ github.event.inputs.port || '8081' }}
         run: |
-          # Create deployment directory
-          ssh $HOST_USER@$HOST_IP "mkdir -p ~/nginx-mlops-deploy"
+          echo "🚀 Starting deployment on port $DEPLOY_PORT..."
           
-          # Copy files
-          scp -r nginx/ scripts/ $HOST_USER@$HOST_IP:~/nginx-mlops-deploy/
-          
-          # Make scripts executable
-          ssh $HOST_USER@$HOST_IP "chmod +x ~/nginx-mlops-deploy/scripts/*.sh"
-          
-          # Deploy
+          # Run deployment script on remote
           ssh $HOST_USER@$HOST_IP "cd ~/nginx-mlops-deploy && \
             DEPLOY_PORT=$DEPLOY_PORT ./scripts/deploy.sh"
           
-          # Health check
+          echo "✅ Deployment script completed"
+      
+      - name: Run health check
+        env:
+          HOST_IP: ${{ secrets.HOST_IP }}
+          HOST_USER: ${{ secrets.HOST_USER }}
+          DEPLOY_PORT: ${{ github.event.inputs.port || '8081' }}
+        run: |
+          echo "🏥 Running health check on remote machine..."
+          
+          # Run health check script on remote
           ssh $HOST_USER@$HOST_IP "cd ~/nginx-mlops-deploy && \
             DEPLOY_PORT=$DEPLOY_PORT ./scripts/health-check.sh"
+          
+          echo "✅ Health check completed"
+      
+      - name: Verify deployment from GitHub runner
+        env:
+          HOST_IP: ${{ secrets.HOST_IP }}
+          DEPLOY_PORT: ${{ github.event.inputs.port || '8081' }}
+        run: |
+          echo "🔍 Verifying deployment from GitHub runner..."
+          
+          # Try to connect to the deployed service
+          echo "⏳ Waiting for service to be accessible from GitHub runner..."
+          sleep 5
+          
+          # Use curl to check if service is accessible (might fail if firewall blocks)
+          if curl -s -f -o /dev/null --connect-timeout 5 http://$HOST_IP:$DEPLOY_PORT; then
+            echo "✅ Service is accessible from GitHub runner"
+          else
+            echo "⚠️ Service not accessible from GitHub runner (might be firewall)"
+            echo "   This is expected if the remote machine is behind a firewall"
+            echo "   Check locally at: http://$HOST_IP:$DEPLOY_PORT"
+          fi
+      
+      - name: Save deployment info
+        env:
+          DEPLOY_PORT: ${{ github.event.inputs.port || '8081' }}
+        run: |
+          cat > deployment-summary.json << EOF
+          {
+            "deployment_time": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "port": $DEPLOY_PORT,
+            "status": "success",
+            "environment": "${{ github.event.inputs.environment || 'production' }}",
+            "commit": "${{ github.sha }}",
+            "workflow": "${{ github.workflow }}"
+          }
+          EOF
+          
+          echo "📊 Deployment summary saved"
+          cat deployment-summary.json
+
+  notify:
+    needs: [test, deploy-local]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send deployment notification
+        env:
+          DEPLOY_STATUS: ${{ needs.deploy-local.result }}
+          DEPLOY_PORT: ${{ github.event.inputs.port || '8081' }}
+        run: |
+          echo "📧 Sending deployment notification..."
+          
+          if [ "$DEPLOY_STATUS" == "success" ]; then
+            echo "✅═══════════════════════════════════════════════════════════════✅"
+            echo "                                                                    "
+            echo "                 🚀 DEPLOYMENT SUCCESSFUL! 🚀                      "
+            echo "                                                                    "
+            echo "✅═══════════════════════════════════════════════════════════════✅"
+            echo ""
+            echo "📊 Deployment Details:"
+            echo "   • Application: Nginx MLOps"
+            echo "   • Port: $DEPLOY_PORT"
+            echo "   • Environment: ${{ github.event.inputs.environment || 'production' }}"
+            echo "   • Commit: ${{ github.sha }}"
+            echo ""
+            echo "🌐 Access your application at:"
+            echo "   • Local: http://localhost:$DEPLOY_PORT"
+            echo "   • Remote: http://${{ secrets.HOST_IP }}:$DEPLOY_PORT"
+            echo "   • Health: http://${{ secrets.HOST_IP }}:$DEPLOY_PORT/health"
+            echo ""
+            echo "📝 Next steps:"
+            echo "   1. Test the application: curl http://localhost:$DEPLOY_PORT"
+            echo "   2. Check health: curl http://localhost:$DEPLOY_PORT/health"
+            echo "   3. View logs: docker logs nginx-mlops"
+            echo ""
+            echo "✅═══════════════════════════════════════════════════════════════✅"
+          else
+            echo "❌═══════════════════════════════════════════════════════════════❌"
+            echo "                                                                    "
+            echo "                    ❌ DEPLOYMENT FAILED! ❌                       "
+            echo "                                                                    "
+            echo "❌═══════════════════════════════════════════════════════════════❌"
+            echo ""
+            echo "🔍 Please check:"
+            echo "   1. GitHub Actions logs for errors"
+            echo "   2. SSH connection to remote machine"
+            echo "   3. Docker status on remote machine"
+            echo "   4. Port $DEPLOY_PORT availability"
+            echo ""
+            echo "📋 View full logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
