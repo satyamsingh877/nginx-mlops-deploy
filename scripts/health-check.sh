@@ -22,74 +22,120 @@ echo -e "${BLUE}═════════════════════�
 echo "📡 Checking application on port $HOST_PORT"
 echo ""
 
+# Function to print status
+print_status() {
+    echo -e "${BLUE}[$(date +'%H:%M:%S')]${NC} $1"
+}
+
+# Function to print success
+print_success() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+# Function to print error
+print_error() {
+    echo -e "${RED}[✗]${NC} $1"
+}
+
 # Check if container exists
 if ! docker ps | grep -q $CONTAINER_NAME; then
-    echo -e "${RED}❌ Container $CONTAINER_NAME is not running${NC}"
+    print_error "Container $CONTAINER_NAME is not running"
+    
+    # Check if container exists but is stopped
+    if docker ps -a | grep -q $CONTAINER_NAME; then
+        print_status "Container exists but is stopped. Last logs:"
+        docker logs --tail 20 $CONTAINER_NAME
+    fi
     exit 1
 fi
 
 # Check container health
-echo -e "${BLUE}📊 Container Status:${NC}"
+print_status "Container Status:"
 docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 # Check HTTP endpoint
 echo ""
-echo -e "${BLUE}🌐 Checking HTTP endpoint...${NC}"
+print_status "Checking HTTP endpoint..."
 RETRY_COUNT=0
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if curl -s -f -o /dev/null "http://localhost:$HOST_PORT"; then
-        STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$HOST_PORT")
-        echo -e "${GREEN}✅ Main page is accessible (HTTP $STATUS_CODE)${NC}"
+    if curl -s -f -o /dev/null "http://localhost:$HOST_PORT" 2>/dev/null; then
+        STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$HOST_PORT" 2>/dev/null)
+        print_success "Main page is accessible (HTTP $STATUS_CODE)"
+        
+        # Get page title
+        PAGE_TITLE=$(curl -s "http://localhost:$HOST_PORT" 2>/dev/null | grep -o "<title>.*</title>" | sed 's/<title>\(.*\)<\/title>/\1/')
+        if [ -n "$PAGE_TITLE" ]; then
+            echo "   Page title: $PAGE_TITLE"
+        fi
         break
     else
         RETRY_COUNT=$((RETRY_COUNT + 1))
         if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-            echo -e "${RED}❌ Main page not accessible after $MAX_RETRIES attempts${NC}"
+            print_error "Main page not accessible after $MAX_RETRIES attempts"
+            echo "   Last error:"
+            curl -v "http://localhost:$HOST_PORT" 2>&1 | tail -5
             exit 1
         fi
-        echo -e "${YELLOW}⏳ Waiting for application... ($RETRY_COUNT/$MAX_RETRIES)${NC}"
+        echo -n "."
         sleep $RETRY_INTERVAL
     fi
 done
+echo ""
 
 # Check health endpoint
-echo -e "${BLUE}🏥 Checking health endpoint...${NC}"
-if curl -s -f "http://localhost:$HOST_PORT/health" | grep -q "healthy"; then
-    echo -e "${GREEN}✅ Health endpoint is healthy${NC}"
+print_status "Checking health endpoint..."
+HEALTH_RESPONSE=$(curl -s "http://localhost:$HOST_PORT/health" 2>/dev/null)
+if echo "$HEALTH_RESPONSE" | grep -q "healthy"; then
+    print_success "Health endpoint is healthy"
+    echo "   Response: $HEALTH_RESPONSE"
 else
-    echo -e "${RED}❌ Health check failed${NC}"
+    print_error "Health check failed"
+    echo "   Response: $HEALTH_RESPONSE"
     exit 1
 fi
 
-# Check metrics endpoint
-echo -e "${BLUE}📈 Checking metrics endpoint...${NC}"
-if curl -s -f -o /dev/null "http://localhost:$HOST_PORT/metrics"; then
-    echo -e "${GREEN}✅ Metrics endpoint is accessible${NC}"
+# Check metrics endpoint (optional)
+print_status "Checking metrics endpoint..."
+if curl -s -f -o /dev/null "http://localhost:$HOST_PORT/metrics" 2>/dev/null; then
+    print_success "Metrics endpoint is accessible"
+    
+    # Show basic metrics
+    CONNECTIONS=$(curl -s "http://localhost:$HOST_PORT/metrics" 2>/dev/null | grep -o "Active connections: [0-9]*" || echo "")
+    if [ -n "$CONNECTIONS" ]; then
+        echo "   $CONNECTIONS"
+    fi
 else
-    echo -e "${YELLOW}⚠️  Metrics endpoint not available (optional)${NC}"
+    print_warning "Metrics endpoint not available (optional)"
 fi
 
 # Get response time
-echo -e "${BLUE}⏱️  Measuring response time...${NC}"
-RESPONSE_TIME=$(curl -o /dev/null -s -w "%{time_total}\n" "http://localhost:$HOST_PORT")
-echo -e "   Response time: ${RESPONSE_TIME}s"
+print_status "Measuring response time..."
+RESPONSE_TIME=$(curl -o /dev/null -s -w "%{time_total}\n" "http://localhost:$HOST_PORT" 2>/dev/null)
+print_success "Response time: ${RESPONSE_TIME}s"
 
 # Check container logs for errors
-echo -e "${BLUE}📋 Checking recent logs for errors...${NC}"
-ERROR_COUNT=$(docker logs --tail 50 $CONTAINER_NAME 2>&1 | grep -i error | wc -l)
-if [ $ERROR_COUNT -eq 0 ]; then
-    echo -e "${GREEN}✅ No errors found in recent logs${NC}"
+print_status "Checking recent logs for errors..."
+ERROR_COUNT=$(docker logs --tail 50 $CONTAINER_NAME 2>&1 | grep -i error | wc -l | tr -d ' ')
+if [ "$ERROR_COUNT" -eq "0" ]; then
+    print_success "No errors found in recent logs"
 else
-    echo -e "${YELLOW}⚠️  Found $ERROR_COUNT errors in recent logs${NC}"
-    docker logs --tail 20 $CONTAINER_NAME 2>&1 | grep -i error || true
+    print_warning "Found $ERROR_COUNT errors in recent logs"
+    echo "   Recent errors:"
+    docker logs --tail 20 $CONTAINER_NAME 2>&1 | grep -i error | head -5 | sed 's/^/   ➜ /'
 fi
+
+# Check disk usage
+print_status "Checking container disk usage..."
+CONTAINER_SIZE=$(docker ps --filter "name=$CONTAINER_NAME" --format "{{.Size}}" 2>/dev/null || echo "unknown")
+echo "   Container size: $CONTAINER_SIZE"
 
 echo ""
 echo -e "${GREEN}════════════════════════════════════════════${NC}"
 echo -e "${GREEN}✅ All health checks passed!${NC}"
 echo -e "${GREEN}════════════════════════════════════════════${NC}"
 echo -e "📊 Summary:"
-echo -e "  - Application: ${GREEN}Healthy${NC}"
-echo -e "  - Port: $HOST_PORT"
-echo -e "  - Response time: ${RESPONSE_TIME}s"
-echo -e "  - Container: $CONTAINER_NAME"
+echo -e "  • Application: ${GREEN}Healthy${NC}"
+echo -e "  • Port: $HOST_PORT"
+echo -e "  • Response time: ${RESPONSE_TIME}s"
+echo -e "  • Container: $CONTAINER_NAME"
+echo -e "  • Status: $(docker ps --filter "name=$CONTAINER_NAME" --format "{{.Status}}")"
