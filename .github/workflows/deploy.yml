@@ -55,7 +55,7 @@ jobs:
       
       - name: Test container
         run: |
-          docker run -d --name test-nginx -p 8082:80 test-nginx
+          docker run -d --name test-nginx -p 8081:80 test-nginx
           sleep 5
           curl -f http://localhost:8082 || exit 1
           docker stop test-nginx
