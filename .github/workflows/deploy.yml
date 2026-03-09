@@ -1,0 +1,97 @@
+name: MLOps Nginx Deployment
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      port:
+        description: 'Port to deploy on'
+        required: false
+        default: '8081'
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Validate file structure
+        run: |
+          required_files=(
+            "nginx/Dockerfile"
+            "nginx/index.html"
+            "scripts/deploy.sh"
+            "scripts/health-check.sh"
+          )
+          for file in "${required_files[@]}"; do
+            if [ -f "$file" ]; then
+              echo "✅ Found $file"
+            else
+              echo "❌ Missing $file"
+              exit 1
+            fi
+          done
+
+  test:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Test Docker build
+        run: docker build -t test-nginx ./nginx
+      
+      - name: Test container
+        run: |
+          docker run -d --name test-nginx -p 8082:80 test-nginx
+          sleep 5
+          curl -f http://localhost:8082 || exit 1
+          docker stop test-nginx
+          docker rm test-nginx
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      
+      - name: Deploy application
+        env:
+          HOST_IP: ${{ secrets.HOST_IP }}
+          HOST_USER: ${{ secrets.HOST_USER }}
+          DEPLOY_PORT: ${{ github.event.inputs.port || '8081' }}
+        run: |
+          # Create deployment directory
+          ssh $HOST_USER@$HOST_IP "mkdir -p ~/nginx-mlops-deploy"
+          
+          # Copy files
+          scp -r nginx/ scripts/ $HOST_USER@$HOST_IP:~/nginx-mlops-deploy/
+          
+          # Make scripts executable
+          ssh $HOST_USER@$HOST_IP "chmod +x ~/nginx-mlops-deploy/scripts/*.sh"
+          
+          # Deploy
+          ssh $HOST_USER@$HOST_IP "cd ~/nginx-mlops-deploy && \
+            DEPLOY_PORT=$DEPLOY_PORT ./scripts/deploy.sh"
+          
+          # Health check
+          ssh $HOST_USER@$HOST_IP "cd ~/nginx-mlops-deploy && \
+            DEPLOY_PORT=$DEPLOY_PORT ./scripts/health-check.sh"
